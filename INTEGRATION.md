@@ -269,6 +269,43 @@ Gửi và nhận nội dung thật yêu cầu:
 
 ---
 
+## 10. SuperApp — Checklist tích hợp nhanh
+
+Dành riêng cho team SuperApp (Aladin). Các file service đã có sẵn trong repo SuperApp, chỉ cần wire và bật flag.
+
+### Env vars cần thêm vào `.env`
+
+```
+PROOFCHAT_BACKEND_ENABLED=true
+PROOFCHAT_API_URL=https://api.proofchat.me/api/v1
+PROOFCHAT_WS_URL=wss://api.proofchat.me/ws/
+```
+
+> Khi `PROOFCHAT_BACKEND_ENABLED=false` (mặc định) → module chạy mock như cũ — offline-first đảm bảo.
+
+### Files đã có, không cần viết lại
+
+| File | Vai trò |
+|---|---|
+| `src/services/proofchat-api.ts` | REST client + `isProofChatBackendEnabled()` + token refresh |
+| `src/services/proofchatAuthBridge.ts` | Lấy `sessionToken` từ PhoenixKey → login ProofChat |
+| `src/types/env.d.ts` | Đã khai báo `PROOFCHAT_BACKEND_ENABLED`, `PROOFCHAT_API_URL` |
+
+### Việc cần làm (SuperApp team)
+
+1. **Thêm env vars** ở trên vào `.env` / CI secrets
+2. **Gọi auth bridge khi module mount** — `proofchatAuthBridge.connectProofChat()` trong `ProofChatHomeScreen`
+3. **Thay MOCK_ROOMS** → `proofChatApi.conversations.list({ take: 50 })`
+4. **Tạo `src/services/proofchatSocket.ts`** — kết nối WS namespace `/chat`, xử lý `contract:message.new`
+5. **Xóa escrow code** khỏi `ProofChatHomeScreen`, `ChatScreen`, `proofchatSlice` (Chat không có escrow)
+
+### Trạng thái server (cần confirm từ team ProofChat)
+
+- `PHOENIXKEY_ENABLED` trên BE staging: đang chờ xác nhận — [ProofChat/BE#11](https://github.com/ProofChat/BE/issues/11)
+- WS path `/ws/`: suy từ nginx config, chờ Lợi confirm
+
+---
+
 ## Liên hệ
 
 Gặp lỗi hoặc cần thêm endpoint → mở issue tại [github.com/ProofChat/Docs](https://github.com/ProofChat/Docs).
