@@ -1,7 +1,8 @@
 # ProofChat — Integration Guide
 
-> Phiên bản: 2026-07-02  
-> Dành cho: team bên ngoài tích hợp ProofChat vào app (SuperApp, AladinWork, hoặc platform khác).
+> Phiên bản: 2026-07-04  
+> Dành cho: team bên ngoài tích hợp ProofChat vào app (SuperApp, AladinWork, hoặc platform khác).  
+> Nguồn đối chiếu kỹ thuật: [`docs/INTEGRATION_DEPLOYMENT.md`](https://github.com/ProofChat/BE/blob/docs/issue-11-integration-confirmations/docs/INTEGRATION_DEPLOYMENT.md) (ProofChat/BE#15)
 
 ---
 
@@ -13,9 +14,7 @@ Server **không bao giờ thấy nội dung plaintext** — chỉ lưu ciphertex
 | Thành phần | URL |
 |---|---|
 | REST API | `https://api.proofchat.me/api/v1` |
-| WebSocket | `wss://api.proofchat.me/ws/` |
-
-> **Lưu ý WebSocket path:** xác nhận path `/ws/` với team ProofChat trước khi deploy lên production. Có thể thay đổi.
+| WebSocket | xem §4 |
 
 ---
 
@@ -36,19 +35,30 @@ Content-Type: application/json
 
 `session_token` là JWT ký bằng Ed25519 (`alg=EdDSA`, `kid=phoenixkey-ed25519-1`), TTL 24 giờ.
 
-**Response:**
+**Response (bọc trong envelope `.data`):**
 ```json
 {
-  "accessToken": "...",
-  "refreshToken": "...",
-  "userDid": "did:phoenix:<slot>:<hash>"
+  "data": {
+    "accessToken": "...",
+    "refreshToken": "...",
+    "userDid": "did:phoenix:<slot>:<hash>"
+  },
+  "message": "...",
+  "statusCode": 201,
+  "timestamp": "..."
 }
 ```
 
+> **Lưu ý:** mọi response REST đều bị `TransformInterceptor` bọc thành `{ data, message, statusCode, timestamp }`. Payload thật nằm dưới `.data`.
+
 | Lỗi | Nguyên nhân |
 |---|---|
-| 401 | Token sai hoặc hết hạn |
+| 503 | `PHOENIXKEY_ENABLED=false` trên server — tính năng bị tắt server-side |
+| 503 | PhoenixKey upstream không truy cập được |
+| 401 | Token sai hoặc hết hạn (chỉ khi flag đã bật) |
 | 429 | Vượt rate limit (5 lần/60 giây) |
+
+> Khi gặp 503, đây là lỗi **cấu hình server** — không phải do token client. Liên hệ team ProofChat để bật staging.
 
 ### 1.2 Refresh token
 
@@ -59,14 +69,15 @@ Content-Type: application/json
 { "refreshToken": "..." }
 ```
 
-**Response:** `{ "accessToken": "...", "refreshToken": "..." }` (token rotation — refreshToken cũ hết hiệu lực).
+**Response `.data`:** `{ "accessToken": "...", "refreshToken": "..." }` (token rotation — refreshToken cũ hết hiệu lực).
 
 ### 1.3 Đăng xuất
 
 ```
 POST /auth/logout
-Authorization: Bearer <accessToken>
 ```
+
+Không cần `Authorization` header — endpoint là `@Public()`.
 
 ---
 
@@ -80,19 +91,29 @@ Mọi request REST cần header `Authorization: Bearer <accessToken>`.
 GET /conversations?type=DIRECT&skip=0&take=50
 ```
 
-**Response:** mảng conversation object:
+**Response `.data`:** `{ data: Conversation[], total: number }` — mảng nằm ở `resp.data.data`.
+
 ```json
-[
-  {
-    "id": "conv_...",
-    "title": "Tên nhóm",   // null nếu là hội thoại 1-1
-    "type": "DIRECT" | "GROUP" | "JOB_NEGOTIATION",
-    "ownerId": "did:phoenix:...",
-    "memberCount": 2,
-    "createdAt": "2026-07-01T00:00:00Z"
+{
+  "data": {
+    "data": [
+      {
+        "id": "conv_...",
+        "title": "Tên nhóm",
+        "type": "DIRECT",
+        "proposalId": null,
+        "avatar": null,
+        "createdAt": "2026-07-01T00:00:00Z",
+        "participants": [...],
+        "_count": { "messages": 5 }
+      }
+    ],
+    "total": 1
   }
-]
+}
 ```
+
+> **Lưu ý:** conversation object **không có** `ownerId` hoặc `memberCount`. Số tin nhắn ở `_count.messages`, danh sách thành viên ở `participants[]`.
 
 Các endpoint khác:
 ```
@@ -124,7 +145,7 @@ POST /conversations
 GET /conversations/:id/messages?deviceId=<deviceId>&limit=15&offset=0
 ```
 
-Response là mảng tin nhắn — mỗi tin có `variants[]` (ciphertext theo thiết bị).
+Response `.data` là mảng tin nhắn — mỗi tin có `variants[]` (ciphertext theo thiết bị).
 
 ### 3.2 Gửi tin nhắn (qua REST)
 
@@ -136,10 +157,20 @@ POST /messages
   "senderId": "did:phoenix:...",
   "createdAt": <unix ms — do client tạo, server không ghi đè>,
   "variants": [
-    { "deviceId": "...", "ciphertext": "..." }
+    {
+      "senderDeviceId": "...",
+      "targetDeviceId": "...",
+      "encryptedContent": {
+        "opkId": "...",
+        "type": 1,
+        "body": "<base64 ciphertext>"
+      }
+    }
   ]
 }
 ```
+
+> `variants[].encryptedContent` là `SignalTransportPayload` — cần đủ `senderDeviceId`, `targetDeviceId`, `encryptedContent`. Payload thiếu field sẽ bị 400 (server dùng `whitelist: true`).
 
 ### 3.3 Tính năng bổ sung
 
@@ -157,45 +188,51 @@ POST /messages
 
 ## 4. WebSocket (Realtime)
 
-Namespace `/chat` — xác thực bằng JWT.
+Namespace `/chat`, xác thực bằng ProofChat `accessToken`.
 
 ### 4.1 Kết nối
 
 ```javascript
 import { io } from 'socket.io-client'
 
-const socket = io("wss://api.proofchat.me/ws/", {
+const socket = io("wss://api.proofchat.me/chat", {
+  path: "/ws/socket.io/",          // bắt buộc — nginx định tuyến /ws/ → WS:8090
   auth: { token: accessToken },
   transports: ["websocket"],
   reconnection: true,
 })
 ```
 
-Hoặc dùng query param: `?token=<accessToken>`.
+Hoặc query param: `?token=<accessToken>`.
+
+> **Token WS = ProofChat `accessToken`** — lấy từ `POST /auth/phoenixkey/login`. KHÔNG dùng `session_token` gốc của PhoenixKey (khác secret, sẽ fail verify).
+
+> **Tại sao cần `path`:** nginx route `location /ws/` → WS:8090 và strip prefix `/ws`. Nếu không set `path`, socket.io gọi `/socket.io/` mặc định → nginx route nhầm sang FE Next.js. Cloudflare không cần thay đổi — WS upgrade đã được nginx xử lý qua `api.proofchat.me`.
 
 ### 4.2 Events — emit từ client
 
 | Event | Payload | Mô tả |
 |---|---|---|
 | `chat.room.join` | `{ roomId: conversationId }` | Vào phòng chat |
-| `contract:message.send` | `{ id, conversationId, timestamp, mimeType, variants[] }` | Gửi tin nhắn |
-| `chat:typing` | `{ conversationId, isTyping: true\|false }` | Trạng thái đang gõ |
-| `chat:message.read` | `{ messageId, conversationId }` | Đánh dấu đã đọc |
+| `contract:message.send` | `{ id, roomId, conversationId, timestamp, mimeType, type, variants[] }` | Gửi tin nhắn |
+| `contract:message.typing` | `{ roomId: conversationId, isTyping: true\|false }` | Trạng thái đang gõ |
+| `contract:message.read` | `{ jobId: conversationId, messageId }` | Đánh dấu đã đọc |
+| `mls:sync.epoch` | `MLSEpochSyncRecord` | Đồng bộ epoch MLS |
 
 ### 4.3 Events — nhận từ server
 
 | Event | Payload | Mô tả |
 |---|---|---|
 | `contract:message.new` | message object | Tin nhắn mới (ciphertext) |
-| `chat:typing` | `{ userId, isTyping }` | Người khác đang gõ |
-| `chat:message.read` | `{ messageId, userId }` | Tin nhắn đã được đọc |
-| `chat:message.delivered` | `{ messageId }` | Tin nhắn đã giao |
-| `chat:message.reaction.added` | `{ messageId, userId, emoji }` | Có reaction mới |
-| `chat:message.pinned` | `{ messageId, conversationId }` | Tin nhắn được ghim |
-| `mls:sync.epoch` | `{ epoch }` | MLS key rotation event |
+| `contract:message.typing` | `{ userId, isTyping }` | Người khác đang gõ |
+| `contract:message.read` | `{ messageId, readBy }` | Tin nhắn đã được đọc |
+| `contract:message.pinned` | `{ roomId, messageId, pinnedBy }` | Tin nhắn được ghim |
+| `contract:message.unpinned` | `{ roomId, messageId }` | Bỏ ghim |
+| `mls:sync.epoch` | `MLSEpochSyncRecord` | MLS key rotation event |
 | `mls:device.joined` | `{ deviceId, userDid }` | Thiết bị mới tham gia |
-| `presence:update` | `{ userId, status }` | Trạng thái online |
 | `error:auth` | `{ message }` | Token hết hạn — refresh và reconnect |
+
+> **Chưa implement** (không emit trong namespace `/chat`): `chat:message.delivered`, `chat:message.reaction.added`, `presence:update`.
 
 ---
 
@@ -207,7 +244,8 @@ Khi flag tắt, toàn bộ module chạy với mock data — không cần backen
 ```
 PROOFCHAT_BACKEND_ENABLED=true    # false = chạy mock
 PROOFCHAT_API_URL=https://api.proofchat.me/api/v1
-PROOFCHAT_WS_URL=wss://api.proofchat.me/ws/
+PROOFCHAT_WS_URL=wss://api.proofchat.me
+PROOFCHAT_WS_PATH=/ws/socket.io/
 ```
 
 **Nguyên tắc bắt buộc:** mọi call tới ProofChat backend phải được guard bởi flag này.  
@@ -219,9 +257,21 @@ App phải chạy được khi flag tắt hoặc backend down.
 
 Gửi và nhận nội dung thật yêu cầu:
 - Thư viện MLS (Messaging Layer Security, RFC 9420)
-- Mỗi thiết bị có KeyPackage đã đăng ký qua `POST /mls/key-packages`
+- Ciphersuite: `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`
+- Mỗi thiết bị có KeyPackage đã đăng ký qua `POST /mls/keypackage`
 - Mã hóa payload → `variants[]` trước khi gửi
 - Giải mã `variants[]` sau khi nhận
+
+**MLS endpoints:**
+
+| Endpoint | Mô tả |
+|---|---|
+| `POST /mls/keypackage` | Đăng ký KeyPackage cho device |
+| `GET /mls/keypackage/status` | Kiểm tra trạng thái |
+| `POST /mls/keypackages/batch` | Lấy KeyPackage nhiều user |
+| `GET /mls/keypackages/room/:conversationId` | KeyPackages theo room |
+| `POST /mls/epoch-sync` | Lưu epoch sync record |
+| `GET /mls/epoch-sync/:conversationId/current` | Epoch hiện tại |
 
 > Nếu chưa có crypto stack trên platform của mình, xem §7 để test tích hợp mà không cần E2EE.
 
@@ -234,11 +284,11 @@ Gửi và nhận nội dung thật yêu cầu:
 | # | Việc | Cách |
 |---|---|---|
 | 1 | Auth bridge | `POST /auth/phoenixkey/login` với session_token |
-| 2 | Danh sách hội thoại thật | `GET /conversations` → thay thế mock data |
-| 3 | Metadata phòng chat | `GET /conversations/:id` → tên, thành viên, loại |
+| 2 | Danh sách hội thoại thật | `GET /conversations` → `resp.data.data[]` |
+| 3 | Metadata phòng chat | `GET /conversations/:id` → tên, participants[], loại |
 | 4 | Nhận tin realtime (ciphertext) | WS `contract:message.new` → hiển thị "Tin nhắn mã hóa 🔒" |
-| 5 | Typing indicator | WS `chat:typing` emit + listen |
-| 6 | Đánh dấu đã đọc | WS `chat:message.read` emit |
+| 5 | Typing indicator | WS `contract:message.typing` emit + listen |
+| 6 | Đánh dấu đã đọc | WS `contract:message.read` emit |
 
 **Chưa làm được ở v2.1** (chờ crypto stack):
 - Gửi tin nhắn thật (cần encode `variants[]`)
@@ -251,11 +301,12 @@ Gửi và nhận nội dung thật yêu cầu:
 
 | HTTP | Ý nghĩa |
 |---|---|
-| 400 | Thiếu hoặc sai format payload |
+| 400 | Thiếu hoặc sai format payload (validation failed) |
 | 401 | Token hết hạn hoặc không hợp lệ → refresh rồi retry |
 | 403 | Không có quyền (không phải thành viên conversation) |
 | 404 | Resource không tồn tại |
 | 429 | Rate limit — thử lại sau `Retry-After` header |
+| 503 | Feature bị tắt server-side (`PHOENIXKEY_ENABLED=false`) hoặc PhoenixKey upstream không truy cập được |
 
 ---
 
@@ -266,6 +317,7 @@ Gửi và nhận nội dung thật yêu cầu:
 - Khi nhận `error:auth` qua WS → gọi `POST /auth/refresh` → reconnect với token mới.
 - PhoenixKey base URL (để verify token): `https://api.phoenixkey.me`
 - PhoenixKey JWKS: `https://api.phoenixkey.me/.well-known/jwks.json` (không có prefix `/api/v1`)
+- Mọi response REST bọc trong `{ data, message, statusCode, timestamp }` — payload thật ở `.data`.
 
 ---
 
@@ -278,7 +330,8 @@ Dành riêng cho team SuperApp (Aladin). Các file service đã có sẵn trong 
 ```
 PROOFCHAT_BACKEND_ENABLED=true
 PROOFCHAT_API_URL=https://api.proofchat.me/api/v1
-PROOFCHAT_WS_URL=wss://api.proofchat.me/ws/
+PROOFCHAT_WS_URL=wss://api.proofchat.me
+PROOFCHAT_WS_PATH=/ws/socket.io/
 ```
 
 > Khi `PROOFCHAT_BACKEND_ENABLED=false` (mặc định) → module chạy mock như cũ — offline-first đảm bảo.
@@ -295,14 +348,14 @@ PROOFCHAT_WS_URL=wss://api.proofchat.me/ws/
 
 1. **Thêm env vars** ở trên vào `.env` / CI secrets
 2. **Gọi auth bridge khi module mount** — `proofchatAuthBridge.connectProofChat()` trong `ProofChatHomeScreen`
-3. **Thay MOCK_ROOMS** → `proofChatApi.conversations.list({ take: 50 })`
-4. **Tạo `src/services/proofchatSocket.ts`** — kết nối WS namespace `/chat`, xử lý `contract:message.new`
+3. **Thay MOCK_ROOMS** → `proofChatApi.conversations.list({ take: 50 })` (nhớ đọc `resp.data.data`)
+4. **Tạo `src/services/proofchatSocket.ts`** — kết nối WS namespace `/chat` (xem §4.1), lắng nghe `contract:message.new`
 5. **Xóa escrow code** khỏi `ProofChatHomeScreen`, `ChatScreen`, `proofchatSlice` (Chat không có escrow)
 
 ### Trạng thái server (cần confirm từ team ProofChat)
 
-- `PHOENIXKEY_ENABLED` trên BE staging: đang chờ xác nhận — [ProofChat/BE#11](https://github.com/ProofChat/BE/issues/11)
-- WS path `/ws/`: suy từ nginx config, chờ Lợi confirm
+- `PHOENIXKEY_ENABLED` trên BE staging: đang chờ bật — [ProofChat/BE#13](https://github.com/ProofChat/BE/issues/13)
+- WS Option A (`ws.proofchat.me`) hoặc Option B (`api.proofchat.me` + `path`): xem [ProofChat/BE#15](https://github.com/ProofChat/BE/pull/15)
 
 ---
 
