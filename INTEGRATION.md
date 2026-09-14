@@ -196,7 +196,6 @@ Namespace `/chat`, xác thực bằng ProofChat `accessToken`.
 import { io } from 'socket.io-client'
 
 const socket = io("wss://api.proofchat.me/chat", {
-  path: "/ws/socket.io/",          // bắt buộc — nginx định tuyến /ws/ → WS:8090
   auth: { token: accessToken },
   transports: ["websocket"],
   reconnection: true,
@@ -207,7 +206,15 @@ Hoặc query param: `?token=<accessToken>`.
 
 > **Token WS = ProofChat `accessToken`** — lấy từ `POST /auth/phoenixkey/login`. KHÔNG dùng `session_token` gốc của PhoenixKey (khác secret, sẽ fail verify).
 
-> **Tại sao cần `path`:** nginx route `location /ws/` → WS:8090 và strip prefix `/ws`. Nếu không set `path`, socket.io gọi `/socket.io/` mặc định → nginx route nhầm sang FE Next.js. Cloudflare không cần thay đổi — WS upgrade đã được nginx xử lý qua `api.proofchat.me`.
+> **Không đặt `path`.** Máy chủ dùng đường mặc định của socket.io (`/socket.io/`). Một bản trước của tài liệu này ghi `path: "/ws/socket.io/"` — giá trị đó **404**, và client đặt theo nó sẽ không bao giờ bắt tay được.
+>
+> Đo lại bất cứ lúc nào, không cần tài khoản:
+>
+> ```bash
+> curl -s "https://api.proofchat.me/socket.io/?EIO=4&transport=polling"
+> ```
+>
+> Đúng thì trả về một gói mở đầu có `"sid"`. Kết nối tiếp vào namespace `/chat` mà không kèm token sẽ nhận `error:auth` với `code: "AUTH_FAILED"` rồi bị ngắt — đó là hành vi đúng, không phải lỗi cấu hình.
 
 ### 4.2 Events — emit từ client
 
@@ -245,11 +252,12 @@ Khi flag tắt, toàn bộ module chạy với mock data — không cần backen
 PROOFCHAT_BACKEND_ENABLED=true    # false = chạy mock
 PROOFCHAT_API_URL=https://api.proofchat.me/api/v1
 PROOFCHAT_WS_URL=wss://api.proofchat.me
-PROOFCHAT_WS_PATH=/ws/socket.io/
 ```
 
 **Nguyên tắc bắt buộc:** mọi call tới ProofChat backend phải được guard bởi flag này.  
 App phải chạy được khi flag tắt hoặc backend down.
+
+**Và nhánh mock phải tự khai là mock.** Khi flag tắt, màn hình phải mang một nhãn người dùng nhìn thấy được. Lý do không đối xứng giữa các module: một danh sách giả chỉ làm người dùng đọc dữ liệu không thật, còn một khung chat giả làm người dùng **gửi một tin cho người thật**, thấy tin đi, và không có gì đi đâu cả. Cái thứ hai là một hành động, không phải một màn hình — nên nhãn ở đây bắt buộc, không tuỳ chọn.
 
 ---
 
@@ -331,8 +339,9 @@ Dành riêng cho team SuperApp (Aladin). Các file service đã có sẵn trong 
 PROOFCHAT_BACKEND_ENABLED=true
 PROOFCHAT_API_URL=https://api.proofchat.me/api/v1
 PROOFCHAT_WS_URL=wss://api.proofchat.me
-PROOFCHAT_WS_PATH=/ws/socket.io/
 ```
+
+> `PROOFCHAT_WS_PATH` đã bị **bỏ**. Bản trước đặt nó thành `/ws/socket.io/`; đường đó 404 và mọi client đặt theo đều không nối được. Dùng đường mặc định của socket.io — không khai biến này nữa, và xoá nó khỏi `.env` nếu đang có.
 
 > Khi `PROOFCHAT_BACKEND_ENABLED=false` (mặc định) → module chạy mock như cũ — offline-first đảm bảo.
 
@@ -352,10 +361,17 @@ PROOFCHAT_WS_PATH=/ws/socket.io/
 4. **Tạo `src/services/proofchatSocket.ts`** — kết nối WS namespace `/chat` (xem §4.1), lắng nghe `contract:message.new`
 5. **Xóa escrow code** khỏi `ProofChatHomeScreen`, `ChatScreen`, `proofchatSlice` (Chat không có escrow)
 
-### Trạng thái server (cần confirm từ team ProofChat)
+### Trạng thái máy chủ — đo 14/09/2026
 
-- `PHOENIXKEY_ENABLED` trên BE staging: đang chờ bật — [ProofChat/BE#13](https://github.com/ProofChat/BE/issues/13)
-- WS Option A (`ws.proofchat.me`) hoặc Option B (`api.proofchat.me` + `path`): xem [ProofChat/BE#15](https://github.com/ProofChat/BE/pull/15)
+Kiểm được bằng ba lệnh dưới đây, không cần tài khoản. Chạy lại trước khi tin bảng này.
+
+| Thứ | Trạng thái | Lệnh đo |
+|---|---|---|
+| REST | **sống** | `curl -s -o /dev/null -w '%{http_code}' https://api.proofchat.me/api/v1/health` → `200` |
+| WebSocket | **sống** | `curl -s "https://api.proofchat.me/socket.io/?EIO=4&transport=polling"` → gói có `"sid"` |
+| Đăng nhập PhoenixKey | **đang TẮT** | `curl -s -X POST https://api.proofchat.me/api/v1/auth/phoenixkey/init -H 'Content-Type: application/json' -d '{}'` → `503 "PhoenixKey integration is disabled"` |
+
+Cửa đăng nhập trả 503 là **fail-closed có chủ ý**, không phải hỏng: khi tính năng chưa bật, mọi lần gọi bị từ chối bằng một mã máy đọc được thay vì trả một phiên không xác thực. Client nên phân biệt `503` ở đường này với lỗi mạng, và hiện cho người dùng một câu nói rõ là tính năng chưa mở — đừng gộp vào nhánh "app hỏng".
 
 ---
 
